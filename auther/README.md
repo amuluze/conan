@@ -1,28 +1,86 @@
 # auther
 
-JWT 认证与令牌管理模块，支持黑名单、令牌撤销、刷新令牌旋转（防重放）等能力。
+JWT 认证与令牌管理模块，基于 go-cache 管理令牌，支持令牌对（Access/Refresh）、刷新令牌旋转与会话级撤销（登出场景）。
 
 模块路径：`github.com/amuluze/conan/auther`
 
 ## 功能概览
 
-- 生成访问令牌与刷新令牌对（HS256）
-- 验证令牌有效性与过期（稳定的过期判定逻辑）
- - 黑名单撤销令牌
-- 刷新令牌旋转：使用成功后自动撤销旧刷新令牌并签发新令牌对，防止重放
-- 显式关闭后台清理协程，避免资源泄漏
+- 生成访问令牌与刷新令牌对（HS256），令牌对共享 SessionID
+- 验证令牌：签名校验、存在性（白名单）与会话撤销标记检查
+- 刷新令牌旋转：删除旧 Refresh，签发新令牌对（沿用 SessionID），防重放
+- 生成单枚访问令牌：`MintAccessToken`
+- 删除单枚令牌：`RemoveToken`
+- 会话级撤销（登出）：`RemoveTokenPair`，仅有 AccessToken 也可撤销本会话下的 Refresh
+- 查询令牌存在性：`HasToken`
+- 从令牌提取信息（不验签）：`GetTokenInfo`
+- 释放资源：`Release`
+
+支持可插拔存储（Storage 接口），可替换为 Redis 等实现。
+
+## 安装
+
+```bash
+go get github.com/amuluze/conan/auther
+```
 
 ## 配置
 
-配置选项：
+配置结构：
 
-- `AccessTokenExp`：访问令牌过期时间，默认 2h
-- `RefreshTokenExp`：刷新令牌过期时间，默认 7d
-- `Issuer`：令牌签发者（JWT `iss`），默认 "conan"
-- `BlackListEnabled`：是否启用黑名单，默认 true
-- `BlackListCleanupInterval`：黑名单清理间隔，默认 1h
+```go
+type Config struct {
+    SecretKey       string
+    AccessTokenExp  time.Duration // 默认 2h
+    RefreshTokenExp time.Duration // 默认 24h
+    Issuer          string        // 默认 "conan"
+}
+```
 
-## 示例代码
+默认配置：
+
+```go
+var DefaultConfig = Config{
+    AccessTokenExp:  2 * time.Hour,
+    RefreshTokenExp: 24 * time.Hour,
+    Issuer:          "conan",
+}
+```
+
+## API 一览
+
+```go
+type Auther interface {
+    // GenerateTokenPair 生成访问令牌和刷新令牌对
+    GenerateTokenPair(ctx context.Context, userID, username, role string, metadata map[string]string) (*TokenPair, error)
+
+    // MintAccessToken 生成访问令牌（仅限 AccessToken）
+    MintAccessToken(ctx context.Context, userID, username, role string, exp time.Duration, metadata map[string]string) (*TokenInfo, error)
+
+    // ValidateToken 验证令牌
+    ValidateToken(ctx context.Context, token string) (*TokenClaims, error)
+
+    // RefreshTokenRotate 刷新令牌旋转（删除旧 Refresh、沿用 SessionID 生成新令牌对）
+    RefreshTokenRotate(ctx context.Context, refreshToken string) (*TokenPair, error)
+
+    // RemoveToken 删除单枚令牌
+    RemoveToken(ctx context.Context, token string) error
+
+    // RemoveTokenPair 基于 AccessToken 或 SessionID 撤销整个会话
+    RemoveTokenPair(ctx context.Context, sessionOrAccessToken string) error
+
+    // HasToken 检查令牌是否存在
+    HasToken(ctx context.Context, token string) bool
+
+    // GetTokenInfo 从令牌中提取信息（不验证签名）
+    GetTokenInfo(token string) (*TokenClaims, error)
+
+    // Release 释放资源
+    Release() error
+}
+```
+
+## 使用示例
 
 ```go
 package main
@@ -30,74 +88,87 @@ package main
 import (
     "context"
     "fmt"
-    auther "github.com/amuluze/conan/auther"
     "time"
+    auther "github.com/amuluze/conan/auther"
 )
 
-// demo 使用示例：创建认证器、生成令牌对、验证、刷新（旋转）与关闭资源。
-func main() {
-    // 1) 创建认证器
-    cfg := auther.AutherConfig{
-        SecretKey:                "your-secret",
-        AccessTokenExp:           2 * time.Hour,
-        RefreshTokenExp:          7 * 24 * time.Hour,
-        Issuer:                   "conan-demo",
-        BlackListEnabled:         true,
-        BlackListCleanupInterval: 1 * time.Hour,
+// newAuther 示例：创建并返回一个 Auther 实例（包含 go-cache 存储）
+// 说明：演示如何构建 Config、初始化默认存储并创建认证器。
+func newAuther() (auther.Auther, error) { // 函数：构建并返回 Auther
+    cfg := &auther.Config{ // 函数内：配置JWT密钥与基本信息
+        SecretKey:       "your-secret",
+        Issuer:          "conan-demo",
+        AccessTokenExp:  2 * time.Hour,
+        RefreshTokenExp: 24 * time.Hour,
     }
-    a, err := auther.NewAuther(&cfg)
-    if err != nil {
-        panic(err)
-    }
+    store := auther.NewCacheStorage(cfg) // 函数内：使用配置创建默认存储
+    return auther.NewAuther(cfg, store)  // 函数内：返回认证器
+}
 
-    // 2) 生成令牌对
-    pair, err := a.GenerateTokenPair(context.Background(), "u1", "user1", "role1", map[string]string{"env": "dev"})
-    if err != nil {
-        panic(err)
-    }
+func main() {
+    // 创建认证器
+    // 说明：完整演示生成、验证、旋转与会话撤销流程。
+    a, err := newAuther() // 函数：获取认证器实例
+    if err != nil { panic(err) }
+
+    // 生成令牌对
+    pair, _ := a.GenerateTokenPair(context.Background(), "u1", "user1", "role1", map[string]string{"env": "dev"}) // 函数：生成令牌对
     fmt.Println("access:", pair.AccessToken.Token)
     fmt.Println("refresh:", pair.RefreshToken.Token)
 
-    // 3) 验证访问令牌
-    if claims, err := a.ValidateToken(context.Background(), pair.AccessToken.Token); err == nil {
-        fmt.Println("validated user:", claims.UserID)
+    // 验证访问令牌
+    if claims, err := a.ValidateToken(context.Background(), pair.AccessToken.Token); err == nil { // 函数：验证令牌并解析Claims
+        fmt.Println("validated user:", claims.UserID, "sid:", claims.SessionID)
     }
 
-    // 4) 刷新令牌（旋转）——推荐：返回新令牌对
-    newPair, err := a.RefreshTokenRotate(context.Background(), pair.RefreshToken.Token)
-    if err != nil {
-        panic(err)
-    }
+    // 刷新令牌旋转
+    newPair, _ := a.RefreshTokenRotate(context.Background(), pair.RefreshToken.Token) // 函数：旋转刷新令牌
     fmt.Println("new access:", newPair.AccessToken.Token)
     fmt.Println("new refresh:", newPair.RefreshToken.Token)
 
-    // 5) 撤销令牌（黑名单启用）
-    _ = a.RevokeToken(context.Background(), newPair.AccessToken.Token)
+    // 单枚删除
+    _ = a.RemoveToken(context.Background(), newPair.AccessToken.Token) // 函数：删除单枚令牌
 
-    // 6) 关闭后台清理协程，避免资源泄漏（接口已提供 Close 方法，重复调用安全）
-    _ = a.Close()
+    // 会话级撤销（登出）：仅有 AccessToken 即可撤销整个会话
+    _ = a.RemoveTokenPair(context.Background(), pair.AccessToken.Token) // 函数：基于Access撤销整个会话
+
+    _ = a.Release() // 函数：释放资源
 }
 ```
 
 ## 注意事项
 
-- **强制旋转**：业务层统一使用 `RefreshTokenRotate`，以保证统一且安全的刷新策略。
-- **关闭资源**：如启用黑名单清理协程，请在应用退出时调用 Close，防止 goroutine 泄漏（库已实现安全的"重复关闭不 panic"）。
-- **过期判断**：过期判断依赖 claims 的 `ExpiresAt` 字段而非错误字符串匹配，行为更稳定。
+- 会话撤销标记：`RemoveTokenPair` 会设置 `sid:<SessionID>:revoked` 标记，`ValidateToken` 检查到该标记即拒绝同会话下所有令牌。
+- 刷新令牌旋转：`RefreshTokenRotate` 会先删除旧 Refresh，再签发新令牌对，防止重放。
+- 令牌白名单：模块使用存储的存在性检查作为白名单，删除或过期后验证失败。
+- 存储键前缀：默认存储会以 `Issuer` 作为键前缀，例如撤销标记实际写入为 `<Issuer>:sid:<SessionID>:revoked`。
+- 安全建议：请妥善管理 `SecretKey`（建议从环境变量加载），并为不同环境设置不同的 `Issuer`。避免将令牌暴露在 URL 等日志中。
 
-### 令牌的生效时间（NotBefore）与过期时间（ExpiresAt）
+## 可插拔存储（Storage 接口）
 
-- 生效时间（NotBefore）：当当前时间早于令牌的 `NotBefore` 时，令牌将被视为“尚未生效”，`ValidateToken` 会返回 `ErrInvalidToken`。
-- 过期时间（ExpiresAt）：当当前时间晚于 `ExpiresAt` 时，令牌将被视为“已过期”，`ValidateToken` 会返回 `ErrExpiredToken`。
-- 稳定性：即使 `ParseWithClaims` 解析失败，模块也会使用 `ParseUnverified` 提取 claims 并进行上述两个时间判定，以提供稳定且可预期的错误类型。
-- 签发策略：当前实现中，访问令牌与刷新令牌的 `NotBefore` 均设置为签发时刻（`time.Now()`），不支持设置“未来生效”的令牌；因此正常情况下不会遇到 NotBefore 未到的情况。
-- 时钟同步建议：为避免由于机器时间偏差导致的误判，建议生产环境保持服务器与客户端的时钟同步（如配置 NTP）。
+```go
+type Storage interface {
+    Set(tokenString string, expiration time.Duration) error
+    Check(tokenString string) (bool, error)
+    Delete(tokenString string) error
+    Close() error
+}
+```
+
+默认实现：`CacheStorage`（基于 `github.com/patrickmn/go-cache`）。
+
+使用默认存储：
+
+```go
+// NewCacheStorage 使用传入的 Config 初始化 go-cache 存储
+// 说明：以 Config.AccessTokenExp 作为默认过期时长，并使用 Config.Issuer 作为键前缀。
+store := auther.NewCacheStorage(cfg)
+```
 
 ## 错误类型
 
 - `ErrInvalidToken`：令牌无效
 - `ErrExpiredToken`：令牌过期
-- `ErrRevokedToken`：令牌已撤销
 - `ErrInvalidTokenType`：令牌类型不符（例如用访问令牌执行刷新）
 - `ErrSecretKeyEmpty`：密钥为空
 
@@ -111,11 +182,11 @@ cd auther && go test ./...
 
 ```
 auther/
-├── auther.go         # 认证器实现
-├── auther_test.go    # 单元测试
-├── blacklist.go      # 简易黑名单实现（内存）
-├── types.go          # 接口与类型定义
-├── go.mod            # 模块定义
+├── auther.go      # 认证器实现
+├── auther_test.go # 单元测试
+├── types.go       # 接口与类型定义
+├── storage.go     # 默认存储实现（go-cache）
+├── go.mod         # 模块定义
 ├── go.sum
-└── README.md         # 本文档
+└── README.md      # 本文档
 ```
